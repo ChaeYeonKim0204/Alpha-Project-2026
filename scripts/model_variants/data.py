@@ -1,0 +1,242 @@
+import os
+import io
+import bisect
+import glob
+import math
+import pickle
+
+import numpy as np
+import pyarrow as pa
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
+from torchvision import transforms
+
+from config import cfg
+
+
+# ─────────────────────────────────────────────
+# Image / LiDAR transforms
+# ─────────────────────────────────────────────
+
+def _make_img_transform(size=None):
+    size = size or cfg.DATA.IMAGE_INPUT_SIZE
+    return transforms.Compose([
+        transforms.Resize(tuple(size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
+def _make_img_transform_raw(size=None):
+    size = size or cfg.DATA.RGB_RECON_SIZE
+    return transforms.Compose([
+        transforms.Resize(tuple(size)),
+        transforms.ToTensor(),
+    ])
+
+
+# ─────────────────────────────────────────────
+# LiDAR point cloud → range view
+# ─────────────────────────────────────────────
+
+def point_cloud_to_range_view(points, H=None, W=None, fov_degrees=None):
+    if H is None or W is None:
+        H, W = cfg.DATA.LIDAR_RANGE_VIEW_SIZE
+    fov_down_deg, fov_up_deg = fov_degrees or cfg.DATA.LIDAR_FOV_DEGREES
+    fov_down = np.deg2rad(fov_down_deg)
+    fov_up   = np.deg2rad(fov_up_deg)
+    fov      = fov_up - fov_down
+
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    r     = np.sqrt(x**2 + y**2 + z**2)
+    yaw   = np.arctan2(y, x)
+    pitch = np.arcsin(z / (r + 1e-8))
+
+    yaw_img   = (yaw / np.pi + 1.0) / 2.0
+    pitch_img = (pitch - fov_down) / fov
+    valid     = np.isfinite(r) & (r > 0) & (pitch_img >= 0.0) & (pitch_img <= 1.0)
+
+    x, y, z, r = x[valid], y[valid], z[valid], r[valid]
+    yaw_img   = yaw_img[valid]
+    pitch_img = pitch_img[valid]
+
+    col = np.clip((yaw_img * (W - 1)).astype(int), 0, W - 1)
+    row = np.clip(((1.0 - pitch_img) * (H - 1)).astype(int), 0, H - 1)
+
+    order = np.argsort(r)[::-1]
+    rv = np.zeros((4, H, W), dtype=np.float32)
+    rv[0, row[order], col[order]] = x[order]
+    rv[1, row[order], col[order]] = y[order]
+    rv[2, row[order], col[order]] = z[order]
+    rv[3, row[order], col[order]] = r[order]
+    return rv
+
+
+# ─────────────────────────────────────────────
+# Arrow manifest helpers
+# ─────────────────────────────────────────────
+
+def build_arrow_manifest(root=None, out_path=None):
+    root     = root     or cfg.DATA.ROOT
+    out_path = out_path or cfg.DATA.MANIFEST_PATH
+    files    = sorted(glob.glob(os.path.join(root, "*.arrow")))
+    manifest = {
+        "root":       root,
+        "train":      [p for p in files if os.path.basename(p).startswith("train_")],
+        "validation": [p for p in files if os.path.basename(p).startswith("validation_")],
+        "test":       [p for p in files if os.path.basename(p).startswith("test_")],
+    }
+    with open(out_path, "wb") as f:
+        pickle.dump(manifest, f)
+    return manifest
+
+
+def load_arrow_manifest(path=None, root=None, rebuild=False):
+    path = path or cfg.DATA.MANIFEST_PATH
+    if rebuild or not os.path.exists(path):
+        return build_arrow_manifest(root=root, out_path=path)
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def _as_arrow_path(name_or_path):
+    if os.path.isabs(name_or_path):
+        return name_or_path
+    return os.path.join(cfg.DATA.ROOT, name_or_path)
+
+
+def _select_from_manifest(manifest, split, preferred=None, use_all=False):
+    files = manifest[split]
+    if use_all:
+        return files
+    if preferred is not None:
+        preferred_path = _as_arrow_path(preferred)
+        if preferred_path in files or os.path.exists(preferred_path):
+            return [preferred_path]
+    return files[:1]
+
+
+# ─────────────────────────────────────────────
+# Datasets
+# ─────────────────────────────────────────────
+
+class MUVODataset(Dataset):
+    def __init__(self, arrow_file, seq_len=4, stride=None, sample_every_n=None,
+                 image_input_size=None, rgb_recon_size=None, lidar_size=None,
+                 frame_step=None, require_contiguous_frames=True):
+        self.seq_len        = int(seq_len)
+        self.sample_every_n = int(sample_every_n or cfg.DATA.SAMPLE_EVERY_N)
+        self.stride         = self.seq_len if stride is None else int(stride)
+        self.arrow_file     = _as_arrow_path(arrow_file)
+        self.lidar_size     = tuple(lidar_size or cfg.DATA.LIDAR_RANGE_VIEW_SIZE)
+        self.img_transform     = _make_img_transform(image_input_size or cfg.DATA.IMAGE_INPUT_SIZE)
+        self.img_transform_raw = _make_img_transform_raw(rgb_recon_size or cfg.DATA.RGB_RECON_SIZE)
+        self.frame_step               = int(frame_step or cfg.DATA.FRAME_STEP)
+        self.require_contiguous_frames = require_contiguous_frames
+
+        self._mmap  = pa.memory_map(self.arrow_file, "r")
+        reader      = pa.ipc.open_stream(self._mmap)
+        self.table  = reader.read_all()
+
+        self.n = self.table.num_rows
+
+        self.index   = []
+        run_ids      = self.table.column("run_id").to_pylist()
+        frames       = self.table.column("frame").to_pylist() if "frame" in self.table.column_names else None
+        max_offset   = (self.seq_len - 1) * self.sample_every_n
+
+        for i in range(0, self.n - max_offset, self.stride):
+            offsets = [j * self.sample_every_n for j in range(self.seq_len)]
+            if not all(run_ids[i + off] == run_ids[i] for off in offsets):
+                continue
+            if self.require_contiguous_frames and frames is not None:
+                expected = self.frame_step * self.sample_every_n
+                if not all(
+                    frames[i + offsets[j]] - frames[i + offsets[j - 1]] == expected
+                    for j in range(1, self.seq_len)
+                ):
+                    continue
+            self.index.append(i)
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        i = self.index[idx]
+        images, images_raw, lidars, actions, speeds = [], [], [], [], []
+
+        for j in range(self.seq_len):
+            k   = i + j * self.sample_every_n
+            row = self.table.slice(k, 1)
+
+            img_bytes = row.column("image_front")[0].as_py()["bytes"]
+            img       = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            images.append(self.img_transform(img))
+            images_raw.append(self.img_transform_raw(img))
+
+            lidar_np = np.array(row.column("lidar")[0].as_py())
+            lidars.append(torch.tensor(point_cloud_to_range_view(lidar_np, *self.lidar_size)))
+
+            actions.append([row.column("throttle")[0].as_py(), row.column("steer")[0].as_py()])
+            speeds.append(row.column("speed_kmh")[0].as_py())
+
+        return {
+            "image":     torch.stack(images),
+            "image_raw": torch.stack(images_raw),
+            "lidar":     torch.stack(lidars),
+            "action":    torch.tensor(actions),
+            "speed":     torch.tensor(speeds),
+            "run_id":    self.table.column("run_id")[i].as_py(),
+            "start_row": i,  # TBPTT frame continuity check
+        }
+
+
+class StreamWindowDataset(MUVODataset):
+    """Interleave contiguous window streams so TBPTT hidden states stay aligned per batch position."""
+
+    def __init__(self, arrow_file, seq_len=4, num_streams=1, stride=None, **kwargs):
+        super().__init__(arrow_file, seq_len=seq_len, stride=stride, **kwargs)
+        self.num_streams = max(1, int(num_streams))
+        self.index       = self._make_stream_order(self.index, self.num_streams)
+
+    @staticmethod
+    def _make_stream_order(index, num_streams):
+        if num_streams <= 1 or len(index) == 0:
+            return index
+
+        chunk_size = math.ceil(len(index) / num_streams)
+        chunks = [
+            index[i * chunk_size: min((i + 1) * chunk_size, len(index))]
+            for i in range(num_streams)
+        ]
+        chunks  = [c for c in chunks if c]
+        min_len = min(len(c) for c in chunks)
+        # 각 chunk tail (min_len 이후)은 TBPTT batch-slot 정렬을 위해 의도적으로 버린다.
+
+        ordered = []
+        for t in range(min_len):
+            for chunk in chunks:
+                ordered.append(chunk[t])
+        return ordered
+
+
+class MultiArrowStreamDataset(Dataset):
+    def __init__(self, arrow_files, seq_len=4, num_streams=1, stride=None, **kwargs):
+        self.datasets = [
+            StreamWindowDataset(path, seq_len=seq_len, num_streams=num_streams, stride=stride, **kwargs)
+            for path in arrow_files
+        ]
+        self.datasets = [ds for ds in self.datasets if len(ds) > 0]
+        if not self.datasets:
+            raise ValueError("No non-empty Arrow datasets were found.")
+        lengths                  = [len(ds) for ds in self.datasets]
+        self.cumulative_lengths  = np.cumsum(lengths).tolist()
+
+    def __len__(self):
+        return self.cumulative_lengths[-1]
+
+    def __getitem__(self, idx):
+        ds_idx = bisect.bisect_right(self.cumulative_lengths, idx)
+        prev   = 0 if ds_idx == 0 else self.cumulative_lengths[ds_idx - 1]
+        return self.datasets[ds_idx][idx - prev]

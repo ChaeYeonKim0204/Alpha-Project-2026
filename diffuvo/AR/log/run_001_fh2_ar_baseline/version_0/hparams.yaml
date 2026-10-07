@@ -1,0 +1,2 @@
+lr: 0.0001
+ae_checkpoint: /home/carol/chaeyeon-kim/alpha26/archive/Diffuvo_WM/logs/diffuvo_ae_fulldata_fh4/version_0/checkpoints/last.ckpt
