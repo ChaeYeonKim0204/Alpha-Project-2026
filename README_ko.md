@@ -170,7 +170,8 @@ flowchart LR
 ```bash
 conda env create -f kcy-alpha.yml && conda activate kcy-alpha   # CUDA 11.8 + PyTorch
 
-# Hugging Face 데이터셋 Arrow 파일 위치: $CARLA_ARROW_ROOT
+# Arrow 파일: HF 데이터셋(rev e3ec78d) → notebooks/data/muvo_dataset_preprocessing.ipynb
+# (스트리밍 build_arrow 셀 · run_015/016 제외 · {split}_run_NNN.arrow 생성) → $CARLA_ARROW_ROOT
 export CARLA_ARROW_ROOT=/path/to/processed ALPHA26_ROOT=$PWD
 python scripts/build_arrow_manifest.py --root $CARLA_ARROW_ROOT
 python scripts/build_arrow_window_index.py --root $CARLA_ARROW_ROOT \
@@ -192,7 +193,7 @@ python scripts/model_variants/train_muvo_2D.py --help
 
 | 폴더 | 내용 |
 |---|---|
-| `notebooks/` | trainer11 notebook(정의 원본) · prototype · 평가 |
+| `notebooks/` | trainer11 notebook(정의 원본) · prototype · 평가 · `data/`: HF 데이터셋 → run별 Arrow 전처리 · EDA |
 | `scripts/` | trainer11 서버 CLI · 데이터셋 index 생성 · 평가 · `model_variants/`: 1D `_muvo` · 2D `_muvo_2D` |
 | `diffuvo/` | Diffuvo `WM`(미래 프레임을 함께 처리하는 denoiser) · `AR`(프레임별 autoregressive) |
 | `experiments/` | `hj`(single-stage diffusion) · `yj`(RSSMTD + waypoint head) |

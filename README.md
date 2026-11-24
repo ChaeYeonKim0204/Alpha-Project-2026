@@ -169,7 +169,8 @@ Full analysis, model lineage and lessons: [docs/postmortem.md](docs/postmortem.m
 ```bash
 conda env create -f kcy-alpha.yml && conda activate kcy-alpha   # CUDA 11.8 + PyTorch
 
-# Arrow files from the Hugging Face dataset under $CARLA_ARROW_ROOT
+# Arrow files: HF dataset (rev e3ec78d) → notebooks/data/muvo_dataset_preprocessing.ipynb
+# (streaming build_arrow cell, drops run_015/016, writes {split}_run_NNN.arrow) → $CARLA_ARROW_ROOT
 export CARLA_ARROW_ROOT=/path/to/processed ALPHA26_ROOT=$PWD
 python scripts/build_arrow_manifest.py --root $CARLA_ARROW_ROOT
 python scripts/build_arrow_window_index.py --root $CARLA_ARROW_ROOT \
@@ -191,7 +192,7 @@ Dataset: [`immanuelpeter/carla-autopilot-multimodal-dataset`](https://huggingfac
 
 | Folder | Contents |
 |---|---|
-| `notebooks/` | trainer11 notebooks (source of the definitions), prototypes, evaluation |
+| `notebooks/` | trainer11 notebooks (source of the definitions), prototypes, evaluation · `data/`: HF dataset → per-run Arrow preprocessing and EDA |
 | `scripts/` | trainer11 server CLI, dataset index builders, evaluation · `model_variants/`: 1D `_muvo`, 2D `_muvo_2D` |
 | `diffuvo/` | Diffuvo `WM` (joint denoiser), `AR` (frame-wise autoregressive) |
 | `experiments/` | `hj` (single-stage diffusion), `yj` (RSSMTD + waypoint head) |
